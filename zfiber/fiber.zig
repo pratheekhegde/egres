@@ -356,6 +356,10 @@ pub const Fiber = struct {
     home_worker_id: u8,
 
     cpu_total_ns: u64,
+    /// TSC at the last charge of this step to a tenant budget. Zero
+    /// until `runFiber` samples it, so a charge before that sample
+    /// cannot treat the raw counter as a delta.
+    budget_mark: u64 = 0,
     /// Coarse-clock millisecond timestamp captured by `park()`.
     /// Used by `dumpFibers` to print "parked_for=Xms" — diagnostic
     /// only, so 1 ms resolution is fine and the read is one atomic

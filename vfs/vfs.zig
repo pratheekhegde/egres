@@ -57,6 +57,15 @@ pub const FileOptions = struct {
 pub const page_size: usize = 4096;
 pub const page_alignment = std.mem.Alignment.fromByteUnits(page_size);
 
+/// Disk pages of a tenant's own reads and writes. Background fibers
+/// have no tenant, so compaction stays on the priority limiter only.
+fn noteTenantIo(bytes: usize) void {
+    if (bytes == 0) return;
+    const id = fiber.ctx().tenant orelse return;
+    const pages = (bytes + page_size - 1) / page_size;
+    fiber.budget.noteIops(id, pages);
+}
+
 pub const Mode = enum {
     default, // default via filesystem
     direct, // O_DIRECT, aligned reads/writes
@@ -147,6 +156,7 @@ pub const FileHandle = struct {
                 total_touched += read_len;
             }
             std.mem.doNotOptimizeAway(sink);
+            noteTenantIo(aligned_size);
             return .{
                 .buf = null,
                 .data = mapped[offset .. offset + len],
@@ -174,6 +184,7 @@ pub const FileHandle = struct {
         // It's possible that buf was set up for a bigger read, but the file ended before that.
         // In that case, the end offset could be total_read.
         const end = @min(prefix + len, total_read);
+        noteTenantIo(total_read);
         return .{
             .buf = buf,
             .data = buf[prefix..end],
@@ -242,6 +253,7 @@ pub const FileHandle = struct {
         // surface as `error.ShortWrite` so the file isn't installed in the
         // manifest as if it were complete.
         if (written != data.len) return error.ShortWrite;
+        noteTenantIo(written);
     }
 
     pub fn sync(self: FileHandle) !void {
@@ -348,6 +360,7 @@ pub const VFS = struct {
             while (true) {
                 if (s.acquireBytes() == 0) break;
             }
+            noteTenantIo(total);
         }
 
         // One BatchOp + page-aligned buffer per request, heap-allocated from

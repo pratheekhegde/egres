@@ -6,7 +6,7 @@ sidebar:
   order: 1
 ---
 
-*Status: Mechanisms are built. Cap enforcement mid-query in future release.*
+*Status: A namespace with a budget is paced at `maybeYield` (CPU nanoseconds and disk pages, one-second window) or fails the statement (live bytes). A cap of zero is uncapped. Every namespace starts that way, until `budget` on the admin port sets one.*
 
 Egres is a single process, using a custom designed coroutine system called
 [zfiber][]. zfiber spawns as many threads as the number of logical cores, and
@@ -49,8 +49,9 @@ Any disk activity causes a fiber to park and wait for the I/O completion,
 meanwhile other fibers can run on the threads. zfiber uses Mitchell Hashimoto's
 [libxev][] which provides io_uring on Linux.
 
-Disk operations are throttled based on priority (and tenancy in future).
-Inspired by the [SILK paper][silk], disk operations carry one of 3 priorities:
+Disk operations are throttled by priority. A namespace with an iops cap
+is also paced at `maybeYield`. Inspired by the [SILK paper][silk], disk
+operations carry one of 3 priorities:
 P0 is for queries, P1 for L0 flushes, and P2 for L1+ compactions. Knowing the
 full bandwidth of the disk, lower priorities get the bandwidth the higher ones
 leave unused. Thus, background compactions don't interfere with queries, and
@@ -70,18 +71,17 @@ memory against the total memory allocated to the process. Every 100ms it sizes
 the block cache up and down to make room for queries and background tasks,
 keeping the process under its specified memory cap.
 
-As of this release, only the total memory used by the process is tracked.
-Future releases will track memory per query and per tenant. An allocation could
-then park the fiber for some duration, waiting for memory to become available,
-or, if over the cap, fail with an error propagated back to the user instead of
-an OOM kill.
+The process total is still what the governor reads. A statement also
+charges allocations to its namespace, and `maybeYield` fails that
+statement with an out-of-memory error when the namespace is over its
+memory cap. CPU and disk pages park until the one-second window turns.
 
 ## One Process: Thousands of Tenants
 
-Given these mechanisms, Egres would be able to accurately meter and throttle the
-CPU ticks spent, the memory used, and the disk IOPS per query, per tenant. That
-allows thousands of tenants to share resources, without any noisy neighbor
-problem, and without running a VM per tenant.
+Given these mechanisms, a namespace with a budget is metered for the CPU
+ticks it spends, the memory it holds, and the disk pages it reads and
+writes. That allows thousands of tenants to share resources, without any
+noisy neighbor problem, and without running a VM per tenant.
 
 <figure class="fig">
   <img src="../figures/query-metering.svg" width="1000" height="432" alt="One query as a fiber: its cpu ticks, memory and disk iops are charged to it and checked against the tenant's caps; over a cap the fiber is parked and resumes as soon as budget allows" loading="lazy" />

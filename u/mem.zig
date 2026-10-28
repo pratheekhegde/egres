@@ -3,9 +3,11 @@
 
 //! Process memory accounting. `CountingAlloc` passes every call to the
 //! allocator under it and counts what the program holds, in live
-//! bytes, one atomic add per call. The process allocator is always one
-//! (`context.gpa`, read through `context.counting()`); the admin `mem`
-//! command and the cache governor read it.
+//! bytes, one atomic add per call. `setLiveHook` sees the same deltas
+//! so a tenant budget can charge whoever is running. The process
+//! allocator is always one (`context.gpa`, read through
+//! `context.counting()`); the admin `mem` command and the cache
+//! governor read the process total. Nothing is refused here.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -43,6 +45,7 @@ pub const CountingAlloc = struct {
         const p = self.inner.rawAlloc(len, al, ra) orelse return null;
 
         const live = self.live_bytes.fetchAdd(len, .monotonic) + len;
+        noteLive(@intCast(len));
 
         if (live > self.limit.load(.monotonic))
             _ = self.over_limit.fetchAdd(1, .monotonic);
@@ -80,12 +83,29 @@ pub const CountingAlloc = struct {
         const self = of(ctx);
         self.inner.rawFree(memory, al, ra);
         _ = self.live_bytes.fetchSub(memory.len, .monotonic);
+        noteLive(-@as(i64, @intCast(memory.len)));
     }
 
     fn resized(self: *CountingAlloc, old_len: usize, new_len: usize) void {
-        if (new_len >= old_len)
-            _ = self.live_bytes.fetchAdd(new_len - old_len, .monotonic)
-        else
-            _ = self.live_bytes.fetchSub(old_len - new_len, .monotonic);
+        if (new_len >= old_len) {
+            const n = new_len - old_len;
+            _ = self.live_bytes.fetchAdd(n, .monotonic);
+            noteLive(@intCast(n));
+        } else {
+            const n = old_len - new_len;
+            _ = self.live_bytes.fetchSub(n, .monotonic);
+            noteLive(-@as(i64, @intCast(n)));
+        }
     }
 };
+
+var live_hook: ?*const fn (i64) void = null;
+
+pub fn setLiveHook(hook: ?*const fn (i64) void) void {
+    live_hook = hook;
+}
+
+fn noteLive(delta: i64) void {
+    if (delta == 0) return;
+    if (live_hook) |hook| hook(delta);
+}
