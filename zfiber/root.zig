@@ -113,6 +113,8 @@ pub const SemaphoreMap = @import("semaphore_map.zig").SemaphoreMap;
 // and PANICS on a spurious wake (resumed before its own deadline fired).
 pub const sleepMs = @import("deadlines.zig").sleepMs;
 
+pub const budget = @import("budget.zig");
+
 // From fs.zig — file I/O that cooperatively parks (zio.File/Dir-compatible).
 pub const fs = @import("fs.zig");
 pub const File = fs.File;

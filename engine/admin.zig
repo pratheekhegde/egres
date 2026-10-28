@@ -43,6 +43,7 @@ pub const Command = union(enum) {
     workers: WorkersCmd,
     profile: ProfileCmd,
     traces: TracesCmd,
+    budget: BudgetCmd,
     help: HelpCmd,
 };
 
@@ -68,6 +69,15 @@ pub const TracesCmd = struct {
 };
 
 pub const HelpCmd = struct {};
+
+/// `budget <ns> [cpu_ns=<n>] [mem=<n>] [iops=<n>]` sets one tenant's
+/// caps. A missing field keeps the current value. Zero clears that cap.
+pub const BudgetCmd = struct {
+    ns: u64,
+    cpu_ns_per_s: ?u64 = null,
+    mem_bytes: ?u64 = null,
+    iops_per_s: ?u64 = null,
+};
 
 /// Static text dumped by the `help` command. Lives next to the parser so
 /// any time we add or change a verb, the help text gets touched in the
@@ -114,6 +124,11 @@ pub const help_text =
     \\  vfs                             VFS bandwidth limiter snapshot
     \\  mem                             memory as egres sees it (live bytes,
     \\                                  cache, tables) and as the allocator does
+    \\  budget <ns> [cpu_ns=<n>] [mem=<n>] [iops=<n>]
+    \\                                  caps for one namespace. cpu_ns is CPU
+    \\                                  nanoseconds per second, mem is live
+    \\                                  bytes, iops is disk pages per second.
+    \\                                  Zero clears that cap.
     \\  locks                           dump every tracked mutex: holder src,
     \\                                  waiter count, last-waiter src
     \\  workers                         per-worker CPU histogram + imbalance
@@ -616,6 +631,38 @@ pub fn parseLine(line: String) !Command {
                 return error.InvalidArg;
         }
         return .{ .traces = req };
+    } else if (std.mem.eql(u8, cmd, "budget")) {
+        const ns_str = it.next() orelse return error.MissingNamespace;
+        const ns = std.fmt.parseInt(u64, ns_str, 10) catch
+            return error.InvalidNamespace;
+        if (ns == 0) return error.InvalidNamespace;
+        var cpu_ns: ?u64 = null;
+        var mem_bytes: ?u64 = null;
+        var iops: ?u64 = null;
+        var any = false;
+        while (it.next()) |tok| {
+            const eq = std.mem.indexOfScalar(u8, tok, '=') orelse
+                return error.InvalidArg;
+            const key = tok[0..eq];
+            const val = tok[eq + 1 ..];
+            const n = std.fmt.parseInt(u64, val, 10) catch
+                return error.InvalidArg;
+            if (std.mem.eql(u8, key, "cpu_ns")) {
+                cpu_ns = n;
+            } else if (std.mem.eql(u8, key, "mem")) {
+                mem_bytes = n;
+            } else if (std.mem.eql(u8, key, "iops")) {
+                iops = n;
+            } else return error.InvalidArg;
+            any = true;
+        }
+        if (!any) return error.InvalidArg;
+        return .{ .budget = .{
+            .ns = ns,
+            .cpu_ns_per_s = cpu_ns,
+            .mem_bytes = mem_bytes,
+            .iops_per_s = iops,
+        } };
     } else if (std.mem.eql(u8, cmd, "help")) {
         return .{ .help = .{} };
     } else {
@@ -887,6 +934,9 @@ pub const AdminServer = struct {
                 },
                 .traces => |req| {
                     self.handleTraces(stream, req) catch return;
+                },
+                .budget => |req| {
+                    self.handleBudget(stream, req) catch return;
                 },
                 .help => {
                     proto.writeHelp(stream) catch return;
@@ -1530,6 +1580,7 @@ pub const AdminServer = struct {
                 try m.write(raft.metrics.g(), &body.writer);
                 try writeLimiterMetrics(&body.writer);
                 try self.writeChunkCacheMetrics(&body.writer);
+                try fiber.budget.write(&body.writer);
             },
             .forest => {
                 try self.engine.forest.writeStats(&body.writer, .{ .scope = .forest });
@@ -1540,6 +1591,20 @@ pub const AdminServer = struct {
         }
         try body.writer.writeByte('\n');
         try stream.writeAll(body.writer.buffered());
+    }
+
+    fn handleBudget(self: *AdminServer, stream: fiber.net.Stream, req: proto.BudgetCmd) !void {
+        _ = self;
+        const cur = fiber.budget.getCaps(req.ns);
+        fiber.budget.set(req.ns, .{
+            .cpu_ns_per_s = req.cpu_ns_per_s orelse cur.cpu_ns_per_s,
+            .mem_bytes = req.mem_bytes orelse cur.mem_bytes,
+            .iops_per_s = req.iops_per_s orelse cur.iops_per_s,
+        }) catch |err| {
+            try proto.writeErr(stream, @errorName(err));
+            return;
+        };
+        try proto.writeOk(stream);
     }
 
     fn handleNsCreate(self: *AdminServer, stream: fiber.net.Stream, req: proto.NsCreateCmd) !void {

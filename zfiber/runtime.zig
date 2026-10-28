@@ -31,6 +31,7 @@ const _coarse = @import("utils").coarse_clock;
 const _deadlines = @import("deadlines.zig");
 const _spinlock = @import("spinlock.zig");
 const _queue = @import("queue.zig");
+const _budget = @import("budget.zig");
 const _fsops = @import("fsops.zig");
 const _context = @import("utils").context;
 
@@ -598,7 +599,9 @@ pub const Worker = struct {
             // rip + parent_context). A wild write while it was queued already
             // faulted at the culprit. Compiles to nothing when the guard is off.
             f.unprotectContext();
+            f.budget_mark = readTicks();
             f.coro.step();
+            chargeFiberBudget(f);
             f.protectContext();
             self.current_fiber = null;
 
@@ -1057,12 +1060,18 @@ pub const Runtime = struct {
         try _fsops.start(allocator, opts.io_threads);
         errdefer _fsops.stop();
 
+        // Tenant budgets use this allocator. Installed before the
+        // singleton is visible, so the first fiber already charges.
+        _budget.bind(allocator);
+        errdefer _budget.unbind();
+
         // Publish as the process singleton. There is exactly one runtime
         // alive at a time; `spawn` resolves it through `runtime()`.
         g_rt = self;
     }
 
     pub fn deinit(self: *Runtime) void {
+        _budget.unbind();
         // Stop the offload pool first: join every pool thread so none is
         // mid-`wake()` into the runtime state we're about to free.
         _fsops.stop();
@@ -1331,6 +1340,7 @@ fn spawn_(
     if (currentFiberOrNull()) |parent| {
         f.ctx.prio = parent.ctx.prio;
         f.ctx.cache = parent.ctx.cache;
+        f.ctx.tenant = parent.ctx.tenant;
         if (!detached) {
             f.ctx.parent = parent.ctx.parent orelse
                 if (parent.ctx.arena != null) &parent.ctx else null;
@@ -1654,6 +1664,35 @@ inline fn pendingSubmissions(loop: *xev.Loop) usize {
 inline fn completionsReady(loop: *xev.Loop) usize {
     if (comptime xev.backend == .io_uring) return loop.ring.cq_ready();
     return 0;
+}
+
+/// Charge the CPU burned since `budget_mark` to the fiber's tenant
+/// and move the mark. A fiber with no tenant still moves the mark, so
+/// the next slice is not measured from process start.
+fn chargeFiberBudget(f: *Fiber) void {
+    const now = readTicks();
+    if (f.budget_mark == 0) {
+        f.budget_mark = now;
+        return;
+    }
+    const ns = cyclesToNs(now -| f.budget_mark);
+    f.budget_mark = now;
+    const id = f.ctx.tenant orelse return;
+    _budget.noteCpu(id, ns);
+}
+
+/// `maybeYield` calls this while the fiber is on the worker, so the
+/// check sees the slice still in progress. `runFiber` charges the tail
+/// after the step returns.
+pub fn chargeBudgetSlice() void {
+    const f = currentFiberOrNull() orelse return;
+    chargeFiberBudget(f);
+}
+
+/// Park the calling fiber for the rest of a tenant's budget window.
+pub fn parkMs(ms: u64) void {
+    if (ms == 0) return;
+    _deadlines.sleepMs(ms);
 }
 
 /// and aarch64 this is a cycle count needing `cyclesToNs` to convert.

@@ -32,12 +32,12 @@
 //!
 //! A context is also where a statement is interruptible: its loops call
 //! `maybeYield` once per batch, and every policy that stops or paces a
-//! statement (the shutdown's stop stage today; cancel and a per-tenant
-//! budget later) delivers through that one call, so the loops never
-//! learn about any of them.
+//! statement (shutdown, and the tenant's CPU, memory, and disk budget)
+//! delivers through that one call, so the loops never learn about them.
 
 const std = @import("std");
 const _rt = @import("runtime.zig");
+const _budget = @import("budget.zig");
 const _shutdown = @import("shutdown.zig");
 const _clock = @import("utils").coarse_clock;
 const _date = @import("utils").date;
@@ -98,6 +98,10 @@ pub const Ctx = struct {
     /// fiber sets its own; a spawn copies the spawner's.
     prio: IoPriority = .p0,
     cache: CachePolicy = .use,
+    /// SQL namespace this fiber is charging, or null for background
+    /// work. A spawn copies it. `finish` clears it with the rest of
+    /// the statement.
+    tenant: ?_budget.Id = null,
     /// The statement this fiber helps, set at spawn for a joinable
     /// fiber: `record` forwards to it. The spawner's frame joins the
     /// helper, so the root outlives it. Null on a root and on a fiber
@@ -140,6 +144,7 @@ pub const Ctx = struct {
     /// fiber's. Must run on the fiber that started it, after its
     /// helpers are joined.
     pub fn finish(self: *Ctx) void {
+        if (self.tenant != null) _rt.chargeBudgetSlice();
         var arena = self.arena.?;
         if (self.counted) _shutdown.installed().?.leaveCtx();
         if (!offer(self, arena, self.elapsedUs())) arena.deinit();
@@ -181,21 +186,28 @@ pub const Ctx = struct {
         return @intCast(@max(0, now - self.start_mono_us));
     }
 
-    pub const YieldError = error{Shutdown};
+    pub const YieldError = error{ Shutdown, TenantMemory };
 
     /// The statement's yield point: a loop calls this once per batch or
     /// block of work, and the runtime may pause the statement here or
-    /// decline to resume it, which comes back as the error. Today it
-    /// only asks whether the process is stopping (`Shutdown.startShutdown`)
-    /// and never parks; the pause is what a cancel or a CPU budget will
-    /// add. The drain stage before the stop is not an interrupt: a
-    /// running statement gets the grace period to finish on its own,
-    /// only `start` refuses new ones. Callers must treat this as a
-    /// blocking call: no spinlock held across it.
+    /// decline to resume it, which comes back as the error. Stopping
+    /// (`Shutdown.startShutdown`) is the decline. A tenant over its
+    /// memory cap is the other. CPU and disk pages park until the
+    /// one-second window turns, and the statement continues. The drain
+    /// stage before the stop is not an interrupt: a running statement
+    /// gets the grace period to finish on its own, only `start` refuses
+    /// new ones. Callers must treat this as a blocking call: no
+    /// spinlock held across it.
     pub fn maybeYield(self: *Ctx) YieldError!void {
-        _ = self;
-        const sd = _shutdown.installed() orelse return;
-        if (sd.isStopping()) return error.Shutdown;
+        if (_shutdown.installed()) |sd| {
+            if (sd.isStopping()) return error.Shutdown;
+        }
+        const id = self.tenant orelse return;
+        _rt.chargeBudgetSlice();
+        const acct = _budget.find(id) orelse return;
+        if (acct.memoryOver()) return error.TenantMemory;
+        const wait = acct.paceWaitMs();
+        if (wait > 0) _rt.parkMs(wait);
     }
 };
 

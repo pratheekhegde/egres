@@ -1145,6 +1145,7 @@ fn replyRunErr(
         // session with the FATAL, so no reply here.
         error.Shutdown => err,
         error.ReadBelowMinRead => _server.replySnapshotTooOld(state),
+        error.TenantMemory => err,
         else => {
             log.err(
                 verb ++ " '{s}': scan: {s}",

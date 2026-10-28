@@ -488,6 +488,7 @@ pub const Handler = struct {
             .startup_complete => |params| try self.onStartup(state, params),
             .query => |sql| {
                 const qctx = fiber.ctx();
+                try self.attachTenant(qctx);
                 try qctx.start(sql);
                 defer qctx.finish();
 
@@ -496,6 +497,7 @@ pub const Handler = struct {
             },
             .execute => |ctx| {
                 const qctx = fiber.ctx();
+                try self.attachTenant(qctx);
                 try qctx.start(ctx.sql);
                 defer qctx.finish();
 
@@ -503,6 +505,7 @@ pub const Handler = struct {
             },
             .describe => |ctx| {
                 const qctx = fiber.ctx();
+                try self.attachTenant(qctx);
                 try qctx.start(ctx.sql);
                 defer qctx.finish();
 
@@ -531,6 +534,15 @@ pub const Handler = struct {
         self.namespace = self.srv.engine.forest.manifest.lookupNamespace(
             if (requested.len > 0) requested else default_database,
         ) orelse 0;
+    }
+
+    /// Charge this statement to the session's namespace. Set before
+    /// `start` so the trace arena is included. Namespace 0 is a session
+    /// whose database did not exist at connect; it is not a tenant.
+    fn attachTenant(self: *Handler, qctx: *fiber.Ctx) !void {
+        if (self.namespace == 0) return;
+        qctx.tenant = self.namespace;
+        try fiber.budget.ensure(self.namespace);
     }
 
     /// The session's namespace if it still exists, else a SQL error and null.
@@ -609,7 +621,8 @@ pub const Handler = struct {
         const stmt = _parse.statement(arena.allocator(), sql_text) catch
             return replySyntaxError(state);
         fiber.ctx().record("parsed", .{});
-        try self.runStatement(state, stmt);
+        self.runStatement(state, stmt) catch |err|
+            return catchTenantMemory(state, err);
     }
 
     /// The extended protocol's Execute: the portal's statement, parsed
@@ -669,7 +682,8 @@ pub const Handler = struct {
                 msg,
             );
         }
-        try self.runStatement(state, stmt);
+        self.runStatement(state, stmt) catch |err|
+            return catchTenantMemory(state, err);
     }
 
     /// The extended protocol's Describe: a SELECT's RowDescription, NoData
@@ -693,8 +707,14 @@ pub const Handler = struct {
             return replySyntaxError(state);
         if (self.txn) |t| if (t.failed) return replyFailedBlock(state);
         switch (stmt) {
-            .select => |sel| try _dml.describeSelect(self, state, sel),
-            .select_row => |sr| try _dml.describeSelectRow(self, state, sr),
+            .select => |sel| {
+                _dml.describeSelect(self, state, sel) catch |err|
+                    return catchTenantMemory(state, err);
+            },
+            .select_row => |sr| {
+                _dml.describeSelectRow(self, state, sr) catch |err|
+                    return catchTenantMemory(state, err);
+            },
             else => try state.sendNoData(),
         }
     }
@@ -1055,6 +1075,19 @@ pub fn replyError(state: *pgwire.ConnState, msg: String) !void {
 
 pub fn replyErrorCode(state: *pgwire.ConnState, code: [5]u8, msg: String) !void {
     try state.sendError(.{ .code = code, .message = msg });
+}
+
+/// A tenant's live bytes are over its cap. The statement stops; the
+/// session does not. `error_sent` is set so an open block fails.
+fn catchTenantMemory(state: *pgwire.ConnState, err: anyerror) !void {
+    if (err == error.TenantMemory) {
+        return replyErrorCode(
+            state,
+            pgwire.sqlstate.out_of_memory,
+            "tenant memory cap exceeded",
+        );
+    }
+    return err;
 }
 
 /// A read was refused as below the read floor
